@@ -10,9 +10,13 @@ iscsi in localhost then access it.
 
 import re
 import os
+import json
 import logging
 from autotest.client import os_dep
 from autotest.client.shared import utils, error
+
+
+TARGET_JSON_PATH = "/etc/target/saveconfig.json"
 
 
 def iscsi_get_sessions():
@@ -96,6 +100,125 @@ def iscsi_discover(portal_ip):
     return session
 
 
+class Tgtadm(object):
+
+    """
+    Linux SCSI Target Administration Utility
+    """
+
+    def __init__(self, params, root_dir="/tmp"):
+        self.initiator = None
+        self.export_flag = False
+        emulated_image = params.get("emulated_image")
+        self.emulated_image = os.path.join(root_dir, emulated_image)
+        self.emulated_id = ""
+        self.emulated_size = params.get("image_size")
+        self.unit = self.emulated_size[-1].upper()
+        self.emulated_size = self.emulated_size[:-1]
+        # maps K,M,G,T => (count, bs)
+        emulated_size = {'K': (1, 1),
+                         'M': (1, 1024),
+                         'G': (1024, 1024),
+                         'T': (1024, 1048576),
+                         }
+        if emulated_size.has_key(self.unit):
+            block_size = emulated_size[self.unit][1]
+            size = int(self.emulated_size) * emulated_size[self.unit][0]
+            self.create_cmd = ("dd if=/dev/zero of=%s count=%s bs=%sK"
+                               % (self.emulated_image, size, block_size)
+                               )
+
+    def get_target_id(self):
+        """
+        Get target id from image name. Only works for emulated iscsi device
+        """
+        cmd = "tgtadm --lld iscsi --mode target --op show"
+        target_info = utils.system_output(cmd)
+        target_id = ""
+        for line in re.split("\n", target_info):
+            if re.findall("Target\s+(\d+)", line):
+                target_id = re.findall("Target\s+(\d+)", line)[0]
+            if re.findall("Backing store path:\s+(/+.+)", line):
+                if self.emulated_image in line:
+                    break
+        else:
+            target_id = ""
+
+        return target_id
+
+    def export_target(self):
+        """
+        Export target in localhost for emulated iscsi
+        """
+        if not os.path.isfile(self.emulated_image):
+            utils.system(self.create_cmd)
+        cmd = "tgtadm --lld iscsi --mode target --op show"
+        try:
+            output = utils.system_output(cmd)
+        except error.CmdError:
+            utils.system("service tgtd restart")
+            output = utils.system_output(cmd)
+        if not re.findall("%s$" % self.target, output, re.M):
+            logging.debug("Need to export target in host")
+            output = utils.system_output(cmd)
+            used_id = re.findall("Target\s+(\d+)", output)
+            emulated_id = 1
+            while str(emulated_id) in used_id:
+                emulated_id += 1
+            self.emulated_id = str(emulated_id)
+            cmd = "tgtadm --mode target --op new --tid %s" % self.emulated_id
+            cmd += " --lld iscsi --targetname %s" % self.target
+            utils.system(cmd)
+            cmd = "tgtadm --lld iscsi --op bind --mode target "
+            cmd += "--tid %s -I ALL" % self.emulated_id
+            utils.system(cmd)
+        else:
+            target_strs = re.findall("Target\s+(\d+):\s+%s$" %
+                                     self.target, output, re.M)
+            self.emulated_id = target_strs[0].split(':')[0].split()[-1]
+
+        cmd = "tgtadm --lld iscsi --mode target --op show"
+        try:
+            output = utils.system_output(cmd)
+        except error.CmdError:   # In case service stopped
+            utils.system("service tgtd restart")
+            output = utils.system_output(cmd)
+
+        # Create a LUN with emulated image
+        if re.findall(self.emulated_image, output, re.M):
+            # Exist already
+            logging.debug("Exported image already exists.")
+            self.export_flag = True
+            return
+        else:
+            luns = len(re.findall("\s+LUN:\s(\d+)", output, re.M))
+            cmd = "tgtadm --mode logicalunit --op new "
+            cmd += "--tid %s --lld iscsi " % self.emulated_id
+            cmd += "--lun %s " % luns
+            cmd += "--backing-store %s" % self.emulated_image
+            utils.system(cmd)
+            self.export_flag = True
+
+    def delete_target(self):
+        """
+        Delete target from host.
+        """
+        cmd = "tgtadm --lld iscsi --mode target --op show"
+        output = utils.system_output(cmd)
+        if re.findall("%s$" % self.target, output, re.M):
+            if self.emulated_id:
+                cmd = "tgtadm --lld iscsi --mode target --op delete "
+                cmd += "--tid %s" % self.emulated_id
+                utils.system(cmd)
+
+
+class Targetcli(object):
+
+    """
+    administration shell for storage targets
+    """
+
+
 class Iscsi(object):
 
     """
@@ -115,27 +238,45 @@ class Iscsi(object):
         else:
             self.id = utils.generate_random_string(4)
         self.initiator = params.get("initiator")
+        self.use_targetcli = False
         if params.get("emulated_image"):
             self.initiator = None
-            os_dep.command("tgtadm")
-            emulated_image = params.get("emulated_image")
-            self.emulated_image = os.path.join(root_dir, emulated_image)
-            self.emulated_id = ""
-            self.emulated_size = params.get("image_size")
-            self.unit = self.emulated_size[-1].upper()
-            self.emulated_size = self.emulated_size[:-1]
             self.export_flag = False
-            # maps K,M,G,T => (count, bs)
-            emulated_size = {'K': (1, 1),
-                             'M': (1, 1024),
-                             'G': (1024, 1024),
-                             'T': (1024, 1048576),
-                             }
-            if emulated_size.has_key(self.unit):
-                block_size = emulated_size[self.unit][1]
-                size = int(self.emulated_size) * emulated_size[self.unit][0]
-                self.create_cmd = ("dd if=/dev/zero of=%s count=%s bs=%sK"
-                                   % (self.emulated_image, size, block_size))
+            try:
+                os_dep.command("tgtadm")
+            except ValueError:
+                logging.warning("Missing tgtadm command, now check targetcli.")
+                os_dep.command("targetcli")
+                cmd = "targetcli ls iscsi"
+                if utils.system(cmd):
+                    raise ValueError("Missing command targetcli with LIO "
+                                     + "iscsi target support")
+                self.use_targetcli = True
+
+            if self.use_targetcli:
+                self.emulated_image = params.get("emulated_image")
+                self.emulated_size = params.get("image_size")
+                self.target_adm = Targetcli(params)
+            else:
+                emulated_image = params.get("emulated_image")
+                self.emulated_image = os.path.join(root_dir, emulated_image)
+                self.emulated_id = ""
+                self.emulated_size = params.get("image_size")
+                self.unit = self.emulated_size[-1].upper()
+                self.emulated_size = self.emulated_size[:-1]
+                # maps K,M,G,T => (count, bs)
+                emulated_size = {'K': (1, 1),
+                                 'M': (1, 1024),
+                                 'G': (1024, 1024),
+                                 'T': (1024, 1048576),
+                                 }
+                if emulated_size.has_key(self.unit):
+                    block_size = emulated_size[self.unit][1]
+                    size = int(self.emulated_size) * emulated_size[self.unit][0]
+                    self.create_cmd = ("dd if=/dev/zero of=%s count=%s bs=%sK"
+                                       % (self.emulated_image, size, block_size)
+                                       )
+                self.target_adm = Tgtadm(params)
 
     def logged_in(self):
         """
@@ -204,17 +345,33 @@ class Iscsi(object):
         """
         Get target id from image name. Only works for emulated iscsi device
         """
-        cmd = "tgtadm --lld iscsi --mode target --op show"
-        target_info = utils.system_output(cmd)
-        target_id = ""
-        for line in re.split("\n", target_info):
-            if re.findall("Target\s+(\d+)", line):
-                target_id = re.findall("Target\s+(\d+)", line)[0]
-            if re.findall("Backing store path:\s+(/+.+)", line):
-                if self.emulated_image in line:
-                    break
-        else:
+        if self.use_targetcli:
+            cmd = "targetcli /iscsi ls |grep TPGs|awk -F'o-' '{ print $2 }'"
+            cmd += "|awk -F' ' '{ print $1 }'"
+            target_wwn = utils.system_output(cmd).split('\n')
+            if target_wwn:
+                f = open(TARGET_JSON_PATH, 'r')
+                json_dict = json.load(f)
+                f.close()
+                for i in len(json_dict['targets']):
+                    
+
+	else:
+            cmd = "tgtadm --lld iscsi --mode target --op show"
+            target_info = utils.system_output(cmd)
             target_id = ""
+            for line in re.split("\n", target_info):
+                if re.findall("Target\s+(\d+)", line):
+                    target_id = re.findall("Target\s+(\d+)", line)[0]
+                if re.findall("Backing store path:\s+(/+.+)", line):
+                    if self.emulated_image in line:
+                        break
+            else:
+                target_id = ""
+
+#        if not target_id:
+#            cmd = "targetcli /iscsi ls |grep TPGs|awk -F'o-' '{ print $2 }'"
+#            cmd += "|awk -F' ' '{ print $1 }'"
 
         return target_id
 
