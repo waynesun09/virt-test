@@ -2709,6 +2709,19 @@ def snapshot_list(name, options=None, **dargs):
     return ret
 
 
+def snapshot_list_test(name, options=None, **dargs):
+    """
+    Get list of snapshots of domain.
+
+    :param name: name of domain
+    :param options: options of snapshot_list
+    :param dargs: standardized virsh function API keywords
+    :return: CmdResult instance
+    """
+    cmd = "snapshot-list %s %s" (name, options)
+    return command(cmd, **dargs)
+
+
 def snapshot_dumpxml(name, snapshot, options=None, to_file=None, **dargs):
     """
     Get dumpxml of snapshot
