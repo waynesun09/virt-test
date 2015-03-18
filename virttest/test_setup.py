@@ -362,6 +362,58 @@ class HugePageConfig(object):
 
         return target_hugepages
 
+    def get_multi_supported_hugepage_size(self):
+        """
+        As '/proc/meminfo' only show default huge page size, this function is
+        for get huge page size of multiple huge page pools.
+
+        For each huge page size supported by the running kernel, a
+        subdirectory will exist, of the form:
+
+            hugepages-${size}kB
+
+        under /sys/kernel/mm/hugepages, get the support size and return a list.
+
+        :return: supported size list in kB unit
+        """
+        pool_path = "/sys/kernel/mm/hugepages"
+        hugepage_size = []
+        if os.path.isdir(pool_path):
+            for path_name in os.listdir(pool_path):
+                logging.debug("path name is %s" % path_name)
+                if os.path.isdir("%s/%s" % (pool_path, path_name)):
+                    hugepage_size.append(path_name.split('-')[1][:-2])
+                    logging.debug(path_name.split('-')[1][:-2])
+            return hugepage_size
+        else:
+            raise ValueError("Root hugepage control sysfs directory %s did not"
+                             " exist" % pool_path)
+
+    def get_node_num_huge_pages(self, node, pagesize):
+        """
+        Get number of pages of certain page size under given numa node.
+
+        :return: node huge pages number of given page size
+        """
+        node_page_path = "/sys/devices/system/node/node%s" % node
+        node_page_path += "/hugepages/hugepages-%skB/nr_hugepages" % pagesize
+        if not os.path.isfile(node_page_path):
+            raise ValueError("%s page size nr_hugepages file of node %s did "
+                             "not exist" % (pagesize, node))
+        out = utils.system_output("cat %s" % node_page_path)
+        return int(out)
+
+    def set_node_num_huge_pages(self, num, node, pagesize):
+        """
+        Set number of pages of certain page size under given numa node.
+        """
+        node_page_path = "/sys/devices/system/node/node%s" % node
+        node_page_path += "/hugepages/hugepages-%skB/nr_hugepages" % pagesize
+        if not os.path.isfile(node_page_path):
+            raise ValueError("%s page size nr_hugepages file of node %s did "
+                             "not exist" % (pagesize, node))
+        utils.run("echo %s > %s" % (num, node_page_path), ignore_status=False)
+
     @error.context_aware
     def set_hugepages(self):
         """
@@ -395,7 +447,8 @@ class HugePageConfig(object):
         if not os.path.ismount(self.hugepage_path):
             if not os.path.isdir(self.hugepage_path):
                 os.makedirs(self.hugepage_path)
-            cmd = "mount -t hugetlbfs none %s" % self.hugepage_path
+            cmd = "mount -t hugetlbfs -o pagesize=%sK " % self.hugepage_size
+            cmd += "none %s" % self.hugepage_path
             utils.system(cmd)
 
     def setup(self):
